@@ -1,0 +1,1204 @@
+---
+title: "Luka Dončić's Scoring Projection (2026–27)"
+author: "Akash Kalaranjan"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+geometry: margin=0.8in
+fontsize: 10pt
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{array}
+  - \usepackage{float}
+  - \usepackage{threeparttable}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  message = FALSE,
+  warning = FALSE
+)
+
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(janitor)
+library(hoopR)
+library(stringi)
+library(tibble)
+
+season_years <- c(
+  "2022-23", "2023-24", "2024-25", "2025-26", "2026-27"
+)
+
+current_season <- "2026-27"
+
+# Freeze the analysis at the same 10-game data cutoff used for the estimates.
+# Change this date when intentionally updating the projection.
+data_cutoff <- as.Date("2026-11-09")
+```
+
+\newpage
+
+# Data collection and preparation
+
+## Retrieve Luka's game logs
+
+```{r download-data}
+get_luka_logs <- function(season_name) {
+  message("Downloading ", season_name)
+  Sys.sleep(1)
+
+  logs <- hoopR::nba_playergamelogs(
+    player_id = "1629029",
+    season = season_name,
+    season_type = "Regular Season",
+    per_mode = "Totals"
+  )
+
+  if (is.list(logs) && "PlayerGameLogs" %in% names(logs)) {
+    logs <- logs[["PlayerGameLogs"]]
+  }
+
+  if (!is.data.frame(logs)) {
+    stop("Unexpected response format for season ", season_name)
+  }
+
+  logs %>%
+    mutate(season = season_name)
+}
+
+luka_all_logs <- bind_rows(
+  lapply(season_years, get_luka_logs)
+)
+
+shooting_data <- luka_all_logs %>%
+  clean_names() %>%
+  mutate(
+    across(
+      c(min, fgm, fga, fg3m, fg3a, ftm, fta, pts),
+      as.numeric
+    ),
+    game_date = as.Date(substr(game_date, 1, 10)),
+    two_pa = fga - fg3a,
+    two_pm = fgm - fg3m
+  ) %>%
+  filter(
+    season != current_season |
+      game_date <= data_cutoff
+  )
+
+luka_shooting <- shooting_data %>%
+  filter(season == current_season) %>%
+  mutate(
+    two_pct = two_pm / two_pa,
+    three_pct = fg3m / fg3a,
+    ft_pct = ftm / fta
+  ) %>%
+  select(
+    game_id, game_date, matchup, min,
+    fga, fgm, fg3a, fg3m, fta, ftm, pts,
+    two_pa, two_pm, two_pct, three_pct, ft_pct
+  )
+
+dir.create("data", showWarnings = FALSE)
+
+write.csv(
+  luka_shooting,
+  "data/luka_shooting_2026_27.csv",
+  row.names = FALSE
+)
+
+luka_shooting
+```
+
+## Season-level scoring and shooting summary
+
+```{r season-summary}
+season_summary <- shooting_data %>%
+  group_by(season) %>%
+  summarise(
+    games = n(),
+    ppg = mean(pts, na.rm = TRUE),
+    two_pa_pg = mean(two_pa, na.rm = TRUE),
+    two_pct = sum(two_pm, na.rm = TRUE) / sum(two_pa, na.rm = TRUE),
+    three_pa_pg = mean(fg3a, na.rm = TRUE),
+    three_pct = sum(fg3m, na.rm = TRUE) / sum(fg3a, na.rm = TRUE),
+    fta_pg = mean(fta, na.rm = TRUE),
+    ft_pct = sum(ftm, na.rm = TRUE) / sum(fta, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(match(season, season_years))
+
+knitr::kable(season_summary, digits = 3)
+```
+
+```{r season-changes}
+season_changes <- season_summary %>%
+  arrange(match(season, season_years)) %>%
+  mutate(
+    across(
+      c(ppg, two_pa_pg, two_pct, three_pa_pg, three_pct, fta_pg, ft_pct),
+      ~ 100 * (.x / lag(.x) - 1)
+    )
+  )
+
+knitr::kable(season_changes, digits = 2)
+```
+
+## Data Collection and Historical Trends
+
+To project Luka Dončić's PPG by the end of the 2026–27 NBA season, I gathered historical and current-season performance data to construct a projection that incorporates both recent form and longer-term scoring trends.
+
+At the time of this analysis, Luka's 32-point performance against the Milwaukee Bucks had not yet been incorporated into the current-season dataset. This represents a limitation in the data collection process. Although the omission affects the completeness of the sample, its influence on the overall scoring average is expected to be relatively small because it represents only one game. Nevertheless, the game should be incorporated before finalizing the projection to ensure that the dataset accurately reflects his available performances.
+
+The second dataframe presents the season-to-season percentage changes across selected statistical categories. For example, the percentage change in PPG is calculated as the difference between the current season's PPG and the previous season's PPG, divided by the previous season's PPG.
+
+One notable finding is that the 2025–26 season exhibits the largest percentage increase in PPG among the selected seasons. This may partly reflect Luka returning to a healthier state following an injury-affected 2024–25 season, during which he averaged fewer than 30 PPG for the first time in the seasons examined.
+
+I considered excluding the 2024–25 season because its results may not fully represent Luka's typical scoring ability when healthy. However, excluding it would risk introducing selection bias by removing an unfavourable season based on contextual assumptions. More importantly, the possibility of injuries affecting Luka's scoring output during the current season cannot be dismissed, particularly given his injury history. Therefore, retaining the 2024–25 season allows the projection to account for a wider range of observed performance outcomes.
+
+# Bayesian scoring baseline
+
+```{r scoring-prior}
+historical_ppg <- tibble(
+  season = c("2022-23", "2023-24", "2024-25", "2025-26"),
+  ppg = c(32.4, 33.9, 28.2, 33.5)
+)
+
+recency_weights <- c(1, 2, 3, 4) / 10
+
+weighted_average <- weighted.mean(
+  historical_ppg$ppg,
+  w = recency_weights
+)
+
+weighted_average
+```
+
+## Estimate the current scoring level
+
+```{r scoring-posterior}
+pts <- luka_shooting$pts
+n <- length(pts)
+xbar <- mean(pts)
+SIG <- sd(pts)
+
+# Historical season-level scoring variation
+historical_variation <- tibble(
+  ppg = c(28.8, 27.7, 28.4, 32.4, 33.9, 28.2, 33.5),
+  games = c(61, 66, 65, 66, 70, 50, 64)
+)
+
+luck <- mean(SIG^2 / historical_variation$games)
+
+TAU <- sqrt(var(historical_variation$ppg) - luck)
+
+if (!is.finite(TAU) || TAU <= 0) {
+  stop("The estimated between-season standard deviation is not positive.")
+}
+
+shrinkage_weight <- TAU^2 / (TAU^2 + SIG^2 / n)
+
+scoring_estimate <- weighted_average +
+  shrinkage_weight * (xbar - weighted_average)
+
+scoring_posterior_sd <- sqrt(
+  1 / (1 / TAU^2 + n / SIG^2)
+)
+
+bayesian_scoring_summary <- tibble(
+  games_observed = n,
+  current_sample_ppg = xbar,
+  historical_baseline_ppg = weighted_average,
+  shrinkage_weight = shrinkage_weight,
+  bayesian_scoring_estimate = scoring_estimate,
+  posterior_sd = scoring_posterior_sd
+)
+
+print(bayesian_scoring_summary, width = Inf)
+```
+
+## Simulate the end-of-season scoring average
+
+```{r scoring-simulation}
+remaining_games <- 70
+simulation_count <- 100000
+
+set.seed(7)
+
+rest_average <- rnorm(
+  simulation_count,
+  mean = scoring_estimate,
+  sd = sqrt(
+    scoring_posterior_sd^2 +
+      SIG^2 / remaining_games
+  )
+)
+
+final_ppg_draws <- (
+  n * xbar + remaining_games * rest_average
+) / (n + remaining_games)
+
+scoring_simulation_summary <- tibble(
+  lower_80 = unname(quantile(final_ppg_draws, 0.10)),
+  median = median(final_ppg_draws),
+  upper_80 = unname(quantile(final_ppg_draws, 0.90)),
+  probability_above_33_5 = mean(final_ppg_draws >= 33.5),
+  probability_above_35 = mean(final_ppg_draws >= 35)
+)
+
+knitr::kable(scoring_simulation_summary, digits = 3)
+```
+
+```{r scoring-simulation-plot, fig.width=7, fig.height=4}
+hist(
+  final_ppg_draws,
+  breaks = 60,
+  main = "Simulated End-of-Season PPG",
+  xlab = "Projected PPG",
+  col = "lightsteelblue",
+  border = "white"
+)
+
+abline(
+  v = quantile(final_ppg_draws, c(0.10, 0.50, 0.90)),
+  lty = c(2, 1, 2),
+  lwd = 2
+)
+```
+
+### Bayesian Scoring Baseline and Simulation
+
+To obtain Luka's historical average of 31.88 PPG, I calculated a weighted average of his scoring averages since the 2022–23 NBA season. This historical average serves as a reference point for predicting his scoring output by the end of the current season. I assigned greater weights to more recent seasons because they are more relevant in describing Luka's current basketball ability, accounting for factors such as his evolving injury history, potential athletic regression, and development as a player. I excluded seasons before 2022–23 because they reflect an earlier stage of his career and likely is less representative of his current scoring ability.
+
+After establishing his historical baseline and incorporating his current-season performance, I applied a Bayesian Normal-Normal model to obtain an estimated scoring average of approximately 34.8 PPG. Looking at the shrinkage weight, approximately 38.7% of the posterior estimate's weight is assigned to the current-season sample, while the remaining 61.3% is assigned to the historical baseline. This produces an estimate that recognizes Luka's strong start while accounting for the uncertainty associated with a relatively small sample.
+
+To account for uncertainty in Luka's scoring over the remainder of the season, I conducted a simulation using 100,000 draws. Each draw represents a possible final-season scoring outcome, generated by simulating Luka's average PPG across the 70 assumed remaining games and combining it with his observed performance across the first 10 games. The simulated remaining-season average is generated from a normal distribution centred at the Bayesian scoring estimate of 34.8 PPG. Its variance combines uncertainty in the underlying scoring level, represented by the posterior variance, and game-to-game scoring variability, represented by the current sample variance divided by the number of remaining games.
+
+The simulation produces a distribution of possible final-season scoring averages. I summarize this distribution using its median and central 80% simulation interval, defined by the 10th and 90th percentiles. I also calculate the probabilities of Luka finishing the season above 33.5 PPG and 35 PPG. The simulation produces a median final-season average of 35.32 PPG, slightly above the Bayesian scoring estimate, with an 80% simulation interval ranging from 32.82 to 37.82 PPG.
+
+These probabilities illustrate the uncertainty surrounding the projection rather than suggesting that either scoring threshold is guaranteed. The Bayesian scoring baseline will serve as a reference point for the subsequent shooting-efficiency and shot-volume analyses. 
+
+# Shooting efficiency
+
+```{r shooting-data-summary}
+historical_shooting <- shooting_data %>%
+  filter(season != current_season) %>%
+  summarise(
+    two_rate = sum(two_pm) / sum(two_pa),
+    three_rate = sum(fg3m) / sum(fg3a),
+    ft_rate = sum(ftm) / sum(fta)
+  )
+
+current_shooting <- shooting_data %>%
+  filter(season == current_season) %>%
+  summarise(
+    two_makes = sum(two_pm),
+    two_attempts = sum(two_pa),
+    three_makes = sum(fg3m),
+    three_attempts = sum(fg3a),
+    ft_makes = sum(ftm),
+    ft_attempts = sum(fta)
+  )
+```
+
+## Beta-Binomial updates
+
+```{r shooting-model}
+prior_effective_attempts <- 100
+
+shooting_model <- tibble(
+  shot_type = c("2P%", "3P%", "FT%"),
+  historical_rate = c(
+    historical_shooting$two_rate,
+    historical_shooting$three_rate,
+    historical_shooting$ft_rate
+  ),
+  makes = c(
+    current_shooting$two_makes,
+    current_shooting$three_makes,
+    current_shooting$ft_makes
+  ),
+  attempts = c(
+    current_shooting$two_attempts,
+    current_shooting$three_attempts,
+    current_shooting$ft_attempts
+  )
+) %>%
+  mutate(
+    alpha_prior = historical_rate * prior_effective_attempts,
+    beta_prior = (1 - historical_rate) * prior_effective_attempts,
+    alpha_post = alpha_prior + makes,
+    beta_post = beta_prior + attempts - makes,
+    raw_rate = makes / attempts,
+    posterior_rate = alpha_post / (alpha_post + beta_post),
+    lower_95 = qbeta(0.025, alpha_post, beta_post),
+    upper_95 = qbeta(0.975, alpha_post, beta_post)
+  )
+
+knitr::kable(
+  shooting_model %>%
+    select(
+      shot_type, historical_rate, raw_rate,
+      posterior_rate, lower_95, upper_95
+    ),
+  digits = 4
+)
+```
+
+# Shot volume
+
+```{r volume-summary}
+volume_season_summary <- shooting_data %>%
+  group_by(season) %>%
+  summarise(
+    games = n(),
+    two_pa_mean = mean(two_pa),
+    two_pa_var = var(two_pa),
+    three_pa_mean = mean(fg3a),
+    three_pa_var = var(fg3a),
+    fta_mean = mean(fta),
+    fta_var = var(fta),
+    total_fga_pg = mean(fga),
+    .groups = "drop"
+  ) %>%
+  arrange(match(season, season_years))
+
+knitr::kable(volume_season_summary, digits = 3)
+```
+
+## Estimate posterior shot volume
+
+```{r volume-model}
+estimate_volume <- function(metric) {
+  mean_column <- paste0(metric, "_mean")
+  variance_column <- paste0(metric, "_var")
+
+  historical_volume <- volume_season_summary %>%
+    filter(season != current_season)
+
+  current_volume <- volume_season_summary %>%
+    filter(season == current_season)
+
+  prior_mean <- weighted.mean(
+    historical_volume[[mean_column]],
+    w = c(1, 2, 3, 4)
+  )
+
+  prior_variance <- var(historical_volume[[mean_column]])
+
+  current_mean <- current_volume[[mean_column]]
+  current_variance <- current_volume[[variance_column]] /
+    current_volume$games
+
+  shrinkage_weight <- prior_variance /
+    (prior_variance + current_variance)
+
+  posterior_mean <- prior_mean +
+    shrinkage_weight * (current_mean - prior_mean)
+
+  posterior_variance <- 1 / (
+    1 / prior_variance + 1 / current_variance
+  )
+
+  tibble(
+    metric = metric,
+    historical_mean = prior_mean,
+    current_mean = current_mean,
+    posterior_mean = posterior_mean,
+    shrinkage_weight = shrinkage_weight,
+    lower_95 = posterior_mean - 1.96 * sqrt(posterior_variance),
+    upper_95 = posterior_mean + 1.96 * sqrt(posterior_variance)
+  )
+}
+
+volume_posterior <- bind_rows(
+  estimate_volume("two_pa"),
+  estimate_volume("three_pa"),
+  estimate_volume("fta")
+)
+
+knitr::kable(volume_posterior, digits = 3)
+```
+
+## Combine shooting efficiency and shot volume
+
+```{r shooting-volume-projection}
+adjusted_ppg <- sum(
+  2 * volume_posterior$posterior_mean[1] *
+    shooting_model$posterior_rate[1],
+  3 * volume_posterior$posterior_mean[2] *
+    shooting_model$posterior_rate[2],
+  volume_posterior$posterior_mean[3] *
+    shooting_model$posterior_rate[3]
+)
+
+shooting_volume_projection <- adjusted_ppg
+
+shooting_volume_projection
+```
+
+## Shooting Efficiency and Shot Volume
+
+To build the model, I believed that incorporating additional layers that directly influence Luka's scoring output was important. One way to estimate a basketball player's scoring average is to break down their scoring into the number of attempts they take, their conversion rate, and the point value associated with each successful attempt. Since two-point field goals, three-point field goals, and free throws have different point values, I separated Luka's scoring into these three categories.
+
+Essentially, I broke down Luka's historical scoring in comparison with his current-season output by examining both shooting efficiency and shot volume. Incorporating these two components is important because understanding which areas contribute most to Luka's scoring, in terms of both volume and efficiency, helps us assess how sustainable his current scoring output may be.
+
+### Shooting efficiency
+
+In the shooting-efficiency dataframe, historical shooting percentages serve as the prior estimates, while current-season makes and attempts provide the new evidence used to update those estimates. The results show that Luka's current shooting percentages are higher than his historical rates across all three categories.
+
+The 95% credible intervals provide ranges of plausible values for each underlying shooting percentage, conditional on the model and its prior assumptions. These estimates will subsequently be combined with projected shot volume to estimate Luka's scoring output.
+
+After examining the credible intervals, both Luka's historical and current shooting percentages fall within the intervals for two-point and three-point shooting. This suggests that the posterior estimates remain compatible with both his established shooting performance and his current-season results. Therefore, there is insufficient evidence from these intervals alone to suggest that his underlying 2P% or 3P% has shifted substantially.
+
+Free-throw shooting presents a different picture. Neither his historical rate of 77.07% nor his current rate of 88.07% falls within the 95% credible interval of 77.42%–87.60%. The posterior distribution places most of its probability between these two observed rates. This reflects the substantial difference between Luka's historical and current free-throw percentages and suggests that his current 88.07% rate may overestimate his sustainable underlying free-throw percentage.
+
+### Shot volume
+
+As for shot volume, historical averages provide a baseline for expected attempts per game, while current-season averages indicate how Luka's shot distribution has changed. Notably, Luka is currently averaging 13.5 three-point attempts per game, compared with his historical average of approximately 10.17. His two-point attempts have decreased from approximately 12.00 to 10.80, while his free-throw attempts have increased from approximately 9.19 to 10.90.
+
+I then applied a shrinkage-based estimation approach to combine the historical averages with the current-season observations. The shrinkage weights determine how much influence the current-season averages have on each posterior estimate. For example, the three-point attempt estimate assigns approximately 63.8% of its weight to the current-season sample, reflecting the observed increase in three-point volume.
+
+The 95% credible intervals for all three shot-volume metrics contain both their historical and current-season averages. This indicates that, despite the observed changes in Luka's shot distribution, both sets of averages remain compatible with the uncertainty surrounding his underlying shot volume. Consequently, the model moderates these early-season changes rather than assuming they will persist at their current levels throughout the season.
+
+### Combining shooting efficiency and shot volume
+
+With posterior estimates for both shooting efficiency and shot volume, I estimated Luka's scoring output using the following relationship:
+
+\[
+PPG =
+2(2PA)(2P\%) +
+3(3PA)(3P\%) +
+(FTA)(FT\%)
+\]
+
+The first component estimates points generated from two-point attempts, the second estimates points generated from three-point attempts, and the final component estimates points generated from free throws.
+
+Substituting the posterior estimates for each metric produces a projected scoring average of approximately 36.12 PPG for the 2026–27 NBA season.
+
+However, an important limitation is that this model does not explicitly account for potential changes in Luka's offensive role or teammate personnel. For example, if Luka plays alongside more pick-and-roll big men who occupy space around the basket, this could influence his shot selection and potentially lead to an increase in three-point attempts. Conversely, different teammate combinations could create more opportunities for drives and finishes around the basket.
+
+Therefore, although the model accounts for historical tendencies and current-season changes in shooting efficiency and shot volume, it does not explicitly model how changes in lineup composition and offensive roles could influence those variables. This is an important consideration when interpreting the 36.12 PPG estimate.
+
+
+# Lineup context
+
+## Historical minutes and On/Off data
+
+```{r historical-lineup-data}
+
+on_off_candidates <- c(
+  "data/on_off_by_season.rds",
+  "C:/Users/akash/OneDrive/Documents/data/on_off_by_season.rds"
+)
+on_off_file <- on_off_candidates[file.exists(on_off_candidates)][1]
+
+if (is.na(on_off_file)) {
+  stop(
+    "Missing on_off_by_season.rds. Working directory is ", getwd(),
+    ". Put the file in ", file.path(getwd(), "data"), "."
+  )
+}
+
+on_off_by_season <- readRDS(on_off_file)
+
+# Use the teammate ID if the file has one; otherwise carry on without it
+if ("VS_PLAYER_ID" %in% names(on_off_by_season)) {
+  on_off_by_season <- on_off_by_season %>%
+    mutate(PLAYER_ID = as.numeric(VS_PLAYER_ID))
+}
+
+luka_minutes_summary <- luka_all_logs %>%
+  filter(season %in% c(
+    "2022-23", "2023-24", "2024-25", "2025-26"
+  )) %>%
+  group_by(season) %>%
+  summarise(
+    GP = n_distinct(GAME_ID),
+    total_minutes = sum(as.numeric(MIN), na.rm = TRUE),
+    MPG = total_minutes / GP,
+    .groups = "drop"
+  )
+
+luka_weighted_mpg <- sum(luka_minutes_summary$total_minutes) /
+  sum(luka_minutes_summary$GP)
+
+knitr::kable(luka_minutes_summary, digits = 2)
+luka_weighted_mpg 
+```
+
+## Historical teammate On/Off scoring rates
+
+```{r table-helpers}
+# Presentation helpers only: they style tables, they never change the numbers.
+library(kableExtra)
+
+# Show missing values (e.g. teammates with no shared minutes) as "--" not "NA"
+options(knitr.kable.NA = "--")
+
+pretty_tbl <- function(df, caption = NULL, digits = 2, col.names = NULL,
+                       long = FALSE, font_size = 8, scale = TRUE,
+                       col_widths = NULL, footnote_text = NULL,
+                       align = NULL) {
+  tbl <- knitr::kable(
+    df,
+    format = "latex",
+    booktabs = TRUE,
+    longtable = long,
+    digits = digits,
+    caption = caption,
+    col.names = col.names,
+    align = align,
+    linesep = ""
+  )
+
+  opts <- if (long) {
+    c("striped", "repeat_header")
+  } else {
+    c("striped", "HOLD_position", if (scale) "scale_down")
+  }
+
+  tbl <- kableExtra::kable_styling(
+    tbl,
+    latex_options = opts,
+    font_size = font_size,
+    position = "center"
+  )
+
+  if (!is.null(col_widths)) {
+    for (nm in names(col_widths)) {
+      tbl <- kableExtra::column_spec(
+        tbl, as.integer(nm), width = col_widths[[nm]]
+      )
+    }
+  }
+
+  if (!is.null(footnote_text)) {
+    tbl <- kableExtra::footnote(
+      tbl,
+      general = footnote_text,
+      general_title = "",
+      footnote_as_chunk = TRUE,
+      threeparttable = TRUE
+    )
+  }
+
+  tbl
+}
+
+# Display-only cleanup of archetype labels (shot_creator -> shot creator)
+tidy_labels <- function(x) gsub("_", " ", x)
+```
+
+```{r historical-on-off}
+on_off_totals <- on_off_by_season %>%
+  filter(!is.na(COURT_STATUS)) %>%
+  mutate(
+    across(
+      c(GP, MIN, PTS, FGM, FGA, FG3M, FG3A, FTM, FTA),
+      as.numeric
+    )
+  ) %>%
+  group_by(PLAYER_ID, PLAYER, COURT_STATUS) %>%
+  summarise(
+    across(
+      c(GP, MIN, PTS, FGM, FGA, FG3M, FG3A, FTM, FTA),
+      ~ sum(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+on_off_ppg <- on_off_totals %>%
+  filter(MIN > 0) %>%
+  mutate(
+    points_per_36 = (PTS / MIN) * 36,
+    standardized_ppg = (PTS / MIN) * luka_weighted_mpg
+  ) %>%
+  select(
+    PLAYER, COURT_STATUS, GP, MIN, PTS,
+    points_per_36, standardized_ppg
+  ) %>%
+  pivot_wider(
+    names_from = COURT_STATUS,
+    values_from = c(
+      GP, MIN, PTS, points_per_36, standardized_ppg
+    )
+  ) %>%
+  mutate(
+    ppg_difference = standardized_ppg_On -
+      standardized_ppg_Off
+  ) %>%
+  arrange(desc(ppg_difference))
+
+pretty_tbl(
+  on_off_ppg %>%
+    select(
+      PLAYER,
+      GP_Off, GP_On,
+      MIN_Off, MIN_On
+    ),
+  caption = "Historical Teammate Playing Time",
+  digits = 1,
+  col.names = c(
+    "Player",
+    "GP Off",
+    "GP On",
+    "Min Off",
+    "Min On"
+  ),
+  long = TRUE,
+  font_size = 9
+)
+
+pretty_tbl(
+  on_off_ppg %>%
+    select(
+      PLAYER,
+      standardized_ppg_Off,
+      standardized_ppg_On,
+      ppg_difference
+    ),
+  caption = "Historical Teammate Scoring Comparison",
+  digits = 2,
+  col.names = c(
+    "Player",
+    "Off PPG",
+    "On PPG",
+    "PPG Difference"
+  ),
+  long = TRUE,
+  font_size = 9
+)
+```
+
+## Historical teammate archetypes
+
+```{r historical-archetypes}
+teammate_archetypes <- tribble(
+  ~PLAYER, ~shot_creator, ~catch_and_shoot, ~movement_shooter,
+  ~interior_scorer, ~floor_general, ~rim_protector,
+  ~defensive_specialist, ~swiss_army_knife,
+
+  "Tim Hardaway Jr.", 0, 1, 1, 0, 0, 0, 0, 0,
+  "Kyrie Irving", 1, 1, 0, 0, 1, 0, 0, 0,
+  "Austin Reaves", 1, 1, 0, 0, 1, 0, 0, 0,
+  "LeBron James", 1, 0, 0, 1, 1, 0, 0, 1,
+  "Josh Green", 0, 1, 0, 0, 0, 0, 1, 0,
+  "Rui Hachimura", 0, 1, 0, 1, 0, 0, 0, 0,
+  "Dwight Powell", 0, 0, 0, 1, 0, 0, 0, 0,
+  "Reggie Bullock Jr.", 0, 1, 0, 0, 0, 0, 1, 0,
+  "Dereck Lively II", 0, 0, 0, 1, 0, 1, 0, 0,
+  "Maxi Kleber", 0, 1, 0, 0, 0, 0, 1, 0,
+  "Derrick Jones Jr.", 0, 0, 0, 1, 0, 0, 1, 0,
+  "Deandre Ayton", 0, 0, 0, 1, 0, 0, 0, 0,
+  "P.J. Washington", 0, 1, 0, 1, 0, 0, 1, 0,
+  "Jaxson Hayes", 0, 0, 0, 1, 0, 1, 0, 0,
+  "Marcus Smart", 0, 0, 0, 0, 1, 0, 1, 0,
+  "Jake LaRavia", 0, 0, 0, 0, 0, 0, 0, 1,
+  "Christian Wood", 0, 1, 0, 1, 0, 0, 0, 0,
+  "Daniel Gafford", 0, 0, 0, 1, 0, 1, 0, 0,
+  "Danté Exum", 0, 0, 0, 0, 1, 0, 1, 0,
+  "Jarred Vanderbilt", 0, 0, 0, 1, 0, 0, 1, 0,
+  "Jaden Hardy", 0, 1, 0, 0, 0, 0, 0, 0,
+  "Dalton Knecht", 0, 1, 1, 0, 0, 0, 0, 0
+)
+
+lineup_analysis <- on_off_ppg %>%
+  left_join(teammate_archetypes, by = "PLAYER")
+
+archetype_columns <- c(
+  "shot_creator", "catch_and_shoot", "movement_shooter",
+  "interior_scorer", "floor_general", "rim_protector",
+  "defensive_specialist", "swiss_army_knife"
+)
+
+unclassified_historical_teammates <- lineup_analysis %>%
+  filter(if_any(all_of(archetype_columns), is.na)) %>%
+  distinct(PLAYER)
+
+if (nrow(unclassified_historical_teammates) > 0) {
+  print(unclassified_historical_teammates)
+  stop("Some historical teammates are missing archetype classifications.")
+}
+
+archetype_analysis <- lineup_analysis %>%
+  pivot_longer(
+    cols = all_of(archetype_columns),
+    names_to = "archetype",
+    values_to = "assigned"
+  ) %>%
+  filter(assigned == 1)
+
+archetype_summary <- archetype_analysis %>%
+  group_by(archetype) %>%
+  summarise(
+    players = n_distinct(PLAYER),
+    mean_ppg_difference = mean(ppg_difference, na.rm = TRUE),
+    median_ppg_difference = median(ppg_difference, na.rm = TRUE),
+    positive_differences = sum(ppg_difference > 0, na.rm = TRUE),
+    total_on_minutes = sum(MIN_On, na.rm = TRUE),
+    total_off_minutes = sum(MIN_Off, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(mean_ppg_difference))
+
+pretty_tbl(
+  archetype_summary %>% mutate(archetype = tidy_labels(archetype)),
+  caption = "Historical Teammate Archetype Summary",
+  digits = 2,
+  col.names = c(
+    "Archetype",
+    "Players",
+    "Mean PPG",
+    "Median PPG",
+    "Positive",
+    "On Min.",
+    "Off Min."
+  ),
+  font_size = 9
+)
+```
+
+## Current teammate archetypes and player IDs
+
+```{r current-archetypes, results='asis'}
+current_teammate_archetypes <- tribble(
+  ~PLAYER, ~shot_creator, ~catch_and_shoot, ~movement_shooter,
+  ~interior_scorer, ~floor_general, ~rim_protector,
+  ~defensive_specialist, ~swiss_army_knife,
+
+  "Austin Reaves",        1, 1, 0, 0, 1, 0, 0, 0,
+  "Quentin Grimes",       0, 1, 0, 0, 0, 0, 1, 0,
+  "Collin Sexton",        1, 1, 0, 0, 0, 0, 0, 0,
+  "Jaden Hardy",          0, 1, 0, 0, 0, 0, 0, 0,
+  "Bronny James",         0, 0, 0, 0, 0, 0, 1, 0,
+  "Cameron Carr",         1, 0, 0, 0, 0, 0, 0, 0,
+  "Chris Mañon",          0, 0, 0, 0, 0, 0, 1, 0,
+  "Matisse Thybulle",     0, 0, 0, 0, 0, 0, 1, 0,
+  "Ziaire Williams",      0, 1, 0, 0, 0, 0, 1, 0,
+  "Adou Thiero",          0, 0, 0, 1, 0, 0, 1, 0,
+  "Jake LaRavia",         0, 0, 0, 0, 0, 0, 0, 1,
+  "Jarred Vanderbilt",    0, 0, 0, 0, 0, 0, 1, 1,
+  "Walker Kessler",       0, 0, 0, 1, 0, 1, 0, 0,
+  "Sandro Mamukelashvili",0, 1, 0, 1, 0, 0, 0, 1,
+  "Kevon Looney",         0, 0, 0, 1, 0, 0, 1, 0
+)
+
+current_player_lookup <- hoopR::nba_commonallplayers(
+  is_only_current_season = 1,
+  season = current_season
+)$CommonAllPlayers %>%
+  filter(TEAM_ID == 1610612747) %>%
+  transmute(
+    PLAYER_ID = PERSON_ID,
+    API_PLAYER = DISPLAY_FIRST_LAST
+  )
+
+normalize_player_name <- function(x) {
+  x %>%
+    stringi::stri_trans_general("Latin-ASCII") %>%
+    tolower() %>%
+    gsub("[^a-z]", "", .)
+}
+
+current_teammate_ids <- current_teammate_archetypes %>%
+  mutate(player_key = normalize_player_name(PLAYER)) %>%
+  left_join(
+    current_player_lookup %>%
+      mutate(player_key = normalize_player_name(API_PLAYER)),
+    by = "player_key"
+  )
+
+unmatched_current_players <- current_teammate_ids %>%
+  filter(is.na(PLAYER_ID)) %>%
+  select(PLAYER)
+
+if (nrow(unmatched_current_players) > 0) {
+  print(unmatched_current_players)
+  warning("Some current teammates were not matched to NBA player IDs.")
+}
+
+current_teammate_ids <- current_teammate_ids %>%
+  filter(!is.na(PLAYER_ID))
+
+# Display version: drops the helper columns (player_key, API_PLAYER),
+# shortens headers, and shows archetype flags as X marks.
+current_teammate_display <- current_teammate_ids %>%
+  transmute(
+    PLAYER,
+    across(
+      all_of(archetype_columns),
+      ~ ifelse(.x == 1, "X", "")
+    ),
+    PLAYER_ID = format(PLAYER_ID, scientific = FALSE, trim = TRUE)
+  )
+
+pretty_tbl(
+  current_teammate_display,
+  caption = "Current Teammate Archetypes and Player IDs",
+  digits = 0,
+  col.names = c(
+    "Player", "Creator", "C\\&S", "Mvmt", "Interior",
+    "Floor Gen.", "Rim Prot.", "Def. Spec.", "Swiss", "Player ID"
+  ),
+  align = c("l", rep("c", 8), "r"),
+  font_size = 9,
+  scale = FALSE
+)
+
+cat(
+  "\n\n\\begingroup\\footnotesize",
+  "\\textit{Creator} = shot creator; \\textit{C\\&S} = catch-and-shoot;",
+  "\\textit{Mvmt} = movement shooter; \\textit{Interior} = interior scorer;",
+  "\\textit{Floor Gen.} = floor general; \\textit{Rim Prot.} = rim protector;",
+  "\\textit{Def. Spec.} = defensive specialist; \\textit{Swiss} = Swiss Army knife.",
+  "\\endgroup\n\n"
+)
+```
+
+## Current-season teammate On/Off data
+
+```{r current-on-off-download}
+current_on_off_by_teammate <- purrr::map_dfr(
+  seq_len(nrow(current_teammate_ids)),
+  function(i) {
+    teammate <- current_teammate_ids[i, ]
+
+    Sys.sleep(0.5)
+
+    result <- hoopR::nba_playervsplayer(
+      player_id = "1629029",
+      vs_player_id = teammate$PLAYER_ID,
+      season = current_season,
+      season_type = "Regular Season",
+      measure_type = "Base",
+      per_mode = "Totals"
+    )
+
+    result$OnOffCourt %>%
+      tibble::as_tibble() %>%
+      mutate(PLAYER = teammate$PLAYER)
+  }
+) %>%
+  mutate(
+    across(c(GP, MIN, PTS), as.numeric)
+  )
+
+current_on_off_rates <- current_on_off_by_teammate %>%
+  filter(MIN > 0) %>%
+  mutate(
+    scoring_rate_per_36 = (PTS / MIN) * 36,
+    standardized_ppg = (PTS / MIN) * luka_weighted_mpg
+  ) %>%
+  select(
+    PLAYER, COURT_STATUS, GP, MIN, PTS,
+    scoring_rate_per_36, standardized_ppg
+  ) %>%
+  pivot_wider(
+    names_from = COURT_STATUS,
+    values_from = c(
+      GP, MIN, PTS, scoring_rate_per_36, standardized_ppg
+    )
+  ) %>%
+  mutate(
+    ppg_difference = standardized_ppg_On -
+      standardized_ppg_Off
+  ) %>%
+  arrange(desc(ppg_difference))
+
+current_lineup_analysis <- current_on_off_rates %>%
+  left_join(current_teammate_archetypes, by = "PLAYER")
+
+pretty_tbl(
+  current_lineup_analysis %>%
+    select(
+      PLAYER, MIN_On, MIN_Off,
+      standardized_ppg_On, standardized_ppg_Off,
+      ppg_difference
+    ),
+  caption = "Current-Season Teammate On/Off Scoring",
+  digits = 2,
+  col.names = c(
+    "Player", "Min On", "Min Off",
+    "On PPG", "Off PPG", "PPG Difference"
+  ),
+  font_size = 9
+)
+```
+
+## Historical archetype priors
+
+```{r archetype-priors}
+historical_archetype_priors <- archetype_analysis %>%
+  group_by(archetype) %>%
+  summarise(
+    n_players = n_distinct(PLAYER),
+    prior_mean = mean(ppg_difference, na.rm = TRUE),
+    prior_sd = sd(ppg_difference, na.rm = TRUE),
+    prior_median = median(ppg_difference, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+prior_components <- current_lineup_analysis %>%
+  pivot_longer(
+    cols = all_of(archetype_columns),
+    names_to = "archetype",
+    values_to = "assigned"
+  ) %>%
+  filter(assigned == 1) %>%
+  left_join(
+    historical_archetype_priors,
+    by = "archetype"
+  ) %>%
+  transmute(
+    PLAYER,
+    archetype,
+    component_mean = prior_mean,
+    component_variance = prior_sd^2 * (1 + 1 / n_players)
+  )
+
+current_player_priors <- prior_components %>%
+  group_by(PLAYER) %>%
+  summarise(
+    prior_mean = mean(component_mean),
+    prior_variance = mean(
+      component_variance + component_mean^2
+    ) - prior_mean^2,
+    prior_sd = sqrt(prior_variance),
+    archetypes = paste(archetype, collapse = ", "),
+    .groups = "drop"
+  )
+
+pretty_tbl(
+  current_player_priors %>%
+    select(PLAYER, archetypes, prior_mean, prior_variance, prior_sd) %>%
+    mutate(archetypes = tidy_labels(archetypes)),
+  caption = "Archetype-Based Prior for Each Current Teammate",
+  digits = 3,
+  col.names = c(
+    "Player", "Archetypes", "Prior Mean", "Prior Var.", "Prior SD"
+  ),
+  col_widths = list(`2` = "6cm"),
+  font_size = 8
+)
+```
+
+## Current-season likelihood uncertainty
+
+```{r current-likelihood}
+current_likelihood <- current_lineup_analysis %>%
+  filter(
+    !is.na(ppg_difference),
+    MIN_On > 0,
+    MIN_Off > 0
+  ) %>%
+  mutate(
+    likelihood_se = luka_weighted_mpg * sqrt(
+      PTS_On / MIN_On^2 +
+        PTS_Off / MIN_Off^2
+    ),
+    likelihood_variance = likelihood_se^2
+  ) %>%
+  select(
+    PLAYER, MIN_On, MIN_Off,
+    ppg_difference, likelihood_se, likelihood_variance
+  )
+
+pretty_tbl(
+  current_likelihood,
+  caption = "Current-Season Likelihood Uncertainty",
+  digits = 3,
+  col.names = c(
+    "Player", "Min On", "Min Off",
+    "PPG Diff.", "Likelihood SE", "Likelihood Var."
+  ),
+  font_size = 9
+)
+```
+
+## Bayesian teammate posterior estimates
+
+```{r teammate-posterior}
+current_lineup_posterior <- current_lineup_analysis %>%
+  filter(!is.na(ppg_difference)) %>%
+  left_join(
+    current_player_priors,
+    by = "PLAYER"
+  ) %>%
+  left_join(
+    current_likelihood %>%
+      select(PLAYER, likelihood_se, likelihood_variance),
+    by = "PLAYER"
+  ) %>%
+  mutate(
+    posterior_variance = 1 / (
+      1 / prior_variance +
+        1 / likelihood_variance
+    ),
+    posterior_mean = posterior_variance * (
+      prior_mean / prior_variance +
+        ppg_difference / likelihood_variance
+    ),
+    posterior_sd = sqrt(posterior_variance)
+  ) %>%
+  select(
+    PLAYER, archetypes, prior_mean, ppg_difference,
+    posterior_mean, prior_sd, likelihood_se, posterior_sd
+  ) %>%
+  arrange(desc(posterior_mean))
+
+pretty_tbl(
+  current_lineup_posterior %>% mutate(archetypes = tidy_labels(archetypes)),
+  caption = "Bayesian Teammate Posterior Estimates",
+  digits = 3,
+  col.names = c(
+    "Player", "Archetypes", "Prior Mean", "Observed Diff.",
+    "Post. Mean", "Prior SD", "Lik. SE", "Post. SD"
+  ),
+  col_widths = list(`2` = "3.8cm"),
+  font_size = 7
+)
+```
+
+## Aggregate lineup-context index
+
+```{r lineup-context}
+lineup_context <- current_lineup_posterior %>%
+  left_join(
+    current_lineup_analysis %>%
+      select(PLAYER, MIN_On),
+    by = "PLAYER"
+  ) %>%
+  filter(MIN_On > 0) %>%
+  mutate(
+    weight = MIN_On / sum(MIN_On)
+  )
+
+lineup_context_summary <- lineup_context %>%
+  summarise(
+    lineup_context_index = sum(weight * posterior_mean),
+    lineup_context_variance = sum(
+      weight * (posterior_sd^2 + posterior_mean^2)
+    ) - lineup_context_index^2,
+    lineup_context_sd = sqrt(lineup_context_variance)
+  )
+
+pretty_tbl(
+  lineup_context_summary,
+  caption = "Aggregate Lineup-Context Index",
+  digits = 3,
+  col.names = c(
+    "Lineup Context Index", "Lineup Context Variance", "Lineup Context SD"
+  ),
+  font_size = 9
+)
+```
+
+## Lineup Context
+
+### Historical Minutes and On/Off Data
+
+Luka averaged 36.29 minutes per game across these seasons when weighted by games played. This weighted average was used as a common playing-time reference when standardizing his scoring rates across different teammate combinations.
+
+### Historical Teammate On/Off Scoring Rates
+
+The results show considerable variation across teammates. Luka's largest positive scoring differences were observed alongside Danté Exum (+6.79 PPG), Jarred Vanderbilt (+5.20 PPG), and Maxi Kleber (+5.09 PPG). Conversely, some of the largest negative differences occurred alongside LeBron James (-11.46 PPG), Daniel Gafford (-8.35 PPG), and Austin Reaves (-6.95 PPG).
+
+These comparisons are descriptive rather than causal. Teammates do not play in identical game situations, and differences in opponents, rotations, injuries, and lineup combinations may contribute to the observed scoring differences.
+
+### Historical Teammate Archetypes
+
+To identify broader patterns beyond individual teammates, historical players were classified into eight basketball archetypes, and these classifications were based on basketball roles and domain knowledge rather than a mutually exclusive statistical clustering procedure. I do also want to add that players can belong to multiple archetypes. For instance, Kyrie Irving is one of the leagues' best shotcreators, and floor spacers.
+
+The historical results indicate that Luka's highest average scoring difference was associated with movement shooters (+3.41 PPG), followed by defensive specialists (+0.99 PPG). In contrast, shot creators (-7.57 PPG) and Swiss Army knives (-3.73 PPG) had negative average differences.
+
+However, these findings should be interpreted cautiously. Archetype sample sizes vary substantially, with some categories containing as few as two players. Furthermore, the mean and median differences sometimes diverge, indicating that individual teammates can substantially influence category-level averages.
+
+### Current Teammate Archetypes and Player IDs
+
+The current roster was classified using the same eight archetypes to maintain consistency between the historical analysis and the current-season projection. As with the historical classifications, archetype assignments were based on basketball roles and domain knowledge. Because players can contribute in multiple ways, overlapping classifications were permitted.
+
+### Current-Season Teammate On/Off Data
+
+The current-season results show substantial variation. The largest positive scoring differences were observed alongside Jarred Vanderbilt (+7.71 PPG), Kevon Looney (+7.57 PPG), and Quentin Grimes (+6.39 PPG). Conversely, negative differences were observed alongside Adou Thiero (-8.34 PPG), Cameron Carr (-7.62 PPG), and Collin Sexton (-5.63 PPG).
+
+These estimates are based on a relatively limited portion of the season. In particular, several teammates have accumulated very few minutes alongside Luka, making their observed scoring differences especially sensitive to small changes in playing time and scoring production.
+
+### Historical Archetype Priors
+
+Historical archetype results were used to construct prior distributions for the current teammates' lineup effects. For players assigned multiple archetypes, the corresponding historical archetype estimates were combined to obtain a player-specific prior mean and variance.
+
+This approach allows historical teammate patterns to inform the current-season estimates while accounting for differences in the uncertainty associated with each archetype. Players assigned archetypes with greater historical variability consequently receive wider prior distributions.
+
+The resulting priors provide an initial estimate of each teammate's potential lineup association before incorporating current-season observations.
+
+### Current-Season Likelihood Uncertainty
+
+The uncertainty of each observed current-season on/off difference was estimated using a Poisson scoring model. Conditional on playing time, points were treated as arising from a Poisson process, with variance equal to the expected number of points.
+
+The resulting likelihood standard errors account for differences in scoring volume and minutes played in the On and Off groups. Teammates with fewer observed minutes generally have greater uncertainty.
+
+This is a working approximation. It assumes independent scoring processes between the On and Off groups and does not fully capture additional variation arising from game-level conditions or overlapping lineup combinations.
+
+### Bayesian Teammate Posterior Estimates
+
+The historical archetype priors were combined with current-season on/off observations using a Normal-Normal Bayesian updating procedure.
+
+The posterior estimates represent a weighted average of the historical prior mean and the observed current-season scoring difference. The amount of weight assigned to each source depends on its relative uncertainty. More uncertain current-season observations receive greater shrinkage toward the historical prior, while more precise observations have greater influence on the posterior estimate.
+
+This approach is particularly useful early in the season, when individual teammates may have accumulated relatively few minutes alongside Luka. Rather than treating potentially noisy observed differences as definitive, the Bayesian procedure incorporates historical information to produce more conservative estimates.
+
+### Aggregate Lineup-Context Index
+
+The individual posterior teammate estimates were combined to obtain an aggregate lineup-context index. The resulting estimate was approximately -0.129 PPG, with a variance of 23.65 and a standard deviation of 4.863 PPG.
+
+The slightly negative estimate suggests a small downward adjustment to Luka's scoring projection based on the estimated current lineup context. However, the relatively large standard deviation indicates substantial uncertainty surrounding this adjustment.
+
+An important limitation is that teammate on/off observations are not independent. Multiple teammates can share the court during the same minutes, meaning their estimated lineup associations may overlap. Consequently, the aggregate index should be interpreted as an exploratory adjustment rather than a precise causal estimate of teammate impact.
+
+Overall, the lineup-context analysis provides a way to incorporate historical teammate relationships and current roster composition into the scoring projection. Its primary contribution is to account for potential lineup-related variation, while Bayesian shrinkage helps mitigate the instability of early-season observations.
+
+
+# Integrated PPG projection
+
+```{r final-projection}
+final_ppg_projection <- tibble(
+  bayesian_scoring_baseline = scoring_estimate,
+  shooting_volume_projection = shooting_volume_projection,
+  lineup_adjustment = lineup_context_summary$lineup_context_index
+) %>%
+  mutate(
+    final_projected_ppg =
+      shooting_volume_projection + lineup_adjustment
+  )
+
+pretty_tbl(
+  final_ppg_projection,
+  caption = "Integrated PPG Projection",
+  digits = 3,
+  col.names = c(
+    "Bayesian Baseline", "Shooting + Volume",
+    "Lineup Adjustment", "Final Projected PPG"
+  ),
+  font_size = 9
+)
+```
+
+## Final Scoring Projection
+
+After accounting for the player archetypes Luka has historically performed best alongside, the potential influence of the current Lakers roster on his usage and scoring efficiency, and his historical shooting percentages and shot volume relative to his early-season performance, my model projects Luka Dončić to average approximately 36 points per game over the 2026–27 regular season.
+
+If this projection does turn out to be accurate, Luka would record the highest single-season scoring average since James Harden's 2018–19 season and the third-highest single-season scoring average since 1964.
+
+Despite the model's relatively high projection, I would personally be somewhat surprised if Luka matched or exceeded 36 PPG. One of the model's main limitations is its sensitivity to his early-season performance. His strong start may not be representative of his scoring production over an entire 82-game season, especially given his tendency to go on hot and cold streaks that may swing his overall PPG dramatically.
+
+On the other hand, there are reasons to believe that an increase in scoring production is realistic. An in-shape Luka with a potentially greater offensive role and increased usage, especially without a ball handler like Lebron now, could reasonably improve upon his previous season's scoring average by approximately 2.5 points per game.
+
+Ultimately, the 36 PPG projection represents an optimistic but statistically supported estimate. Whether Luka can sustain this level of production will depend on his ability to maintain his early-season efficiency and shot volume throughout the remainder of the season, as well as how the Lakers' evolving lineup affects his offensive role.
