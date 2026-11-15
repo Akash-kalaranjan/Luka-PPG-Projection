@@ -78,7 +78,3 @@ The projection is subject to several limitations:
 - Archetype classifications and prior distributions involve modelling assumptions.
 
 Consequently, the lineup adjustment should not be interpreted as a causal effect of individual teammates on Luka's scoring.
-
-vailable in the `data/` directory.
-5. Knit the R Markdown document to PDF.
-Mathematics Specialist — Statistics Stream
